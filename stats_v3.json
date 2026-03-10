@@ -1,22 +1,7 @@
 {
-  "wins": 5,
-  "losses": 3,
+  "wins": 0,
+  "losses": 0,
   "pnl": 0,
-  "updated": "2026-03-10T00:30:50.862920+00:00",
-  "recent": [
-    {
-      "slug": "btc-updown-5m-1773102000",
-      "side": "DOWN",
-      "amount": 6.02,
-      "result": "LOSS",
-      "profit": -6.023,
-      "source": "REVERSAL",
-      "buy_pres": 0.263,
-      "vol_surge": 3.07,
-      "delta": 0.0814,
-      "conf": 0.672,
-      "tr": 5,
-      "odd": 0.01
-    }
-  ]
+  "updated": "1970-01-01T00:00:00+00:00",
+  "recent": []
 }

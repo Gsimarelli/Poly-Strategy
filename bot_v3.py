@@ -98,7 +98,7 @@ class Config:
     min_micro_confirm_rate: float = 0.5   # menor exigência de trades/s
     last_second_max_delta: float = 0.18   # tolera delta maior no T<=2s
     last_second_min_surge: float = 1.6    # reduz exigência de volume extremo
-    max_odds_age_ms: float = 1200.0       # evita executar com snapshot de odds velho
+    max_odds_age_ms: float = 700.0        # evita executar com odds stale na zona crítica
 
     # ── Filtro combo δ × volume ──────────────────────────────────────────────
     weak_combo_delta: float = 0.16    # Distância maior antes de endurecer o filtro
@@ -110,6 +110,8 @@ class Config:
 
     # ── Momentum (fallback) ──
     enable_momentum: bool = False      # Desativado: operação exclusiva em REVERSAL
+    hot_callback_min_interval_ms: float = 20.0  # throttle do callback hot (menor = mais reativo)
+    critical_loop_sleep_ms: float = 10.0        # sleep mínimo do loop backup na zona crítica
     momentum_start: int = 10           # fallback opcional
     momentum_end: int = 5
     min_momentum_delta: float = 0.015
@@ -129,11 +131,11 @@ class Config:
     # Exemplo: apostando UP, mas book_imbalance = -0.40 (40% mais liquidez DOWN) → skip
 
     # ── Trade Rate (confirmação de whale real) ────────────────────────────
-    min_trade_rate: float = 0.8  # mínimo de trades/s mais permissivo
+    min_trade_rate: float = 0.6  # mínimo de trades/s ainda mais permissivo
 
     # ── Janela de Confirmação do Sinal ────────────────────────────────────
-    signal_confirm_ms: float = 120.0       # T >= 4s: confirmação normal
-    signal_confirm_ms_urgent: float = 25.0  # T <= 3s: confirmação mínima para não atrasar entrada
+    signal_confirm_ms: float = 80.0        # confirmação mais rápida sem perder robustez
+    signal_confirm_ms_urgent: float = 12.0  # últimos 3s: reação ultra-rápida
 
     # ── Scalp (saída antecipada para garantir lucro) ─────────────────────
     enable_scalp: bool = True
@@ -178,6 +180,13 @@ class Config:
         self.max_daily_loss   = float(os.getenv("MAX_DAILY_LOSS",     str(self.max_daily_loss)))
         self.buy_pressure_thresh = float(os.getenv("BUY_PRESSURE_THRESH", str(self.buy_pressure_thresh)))
         self.min_vol_surge    = float(os.getenv("MIN_VOL_SURGE",      str(self.min_vol_surge)))
+        self.min_price_vel     = float(os.getenv("MIN_PRICE_VEL",      str(self.min_price_vel)))
+        self.max_reversal_delta = float(os.getenv("MAX_REVERSAL_DELTA", str(self.max_reversal_delta)))
+        self.min_trade_rate    = float(os.getenv("MIN_TRADE_RATE",     str(self.min_trade_rate)))
+        self.signal_confirm_ms = float(os.getenv("SIGNAL_CONFIRM_MS",  str(self.signal_confirm_ms)))
+        self.signal_confirm_ms_urgent = float(os.getenv("SIGNAL_CONFIRM_MS_URGENT", str(self.signal_confirm_ms_urgent)))
+        self.hot_callback_min_interval_ms = float(os.getenv("HOT_CALLBACK_MIN_INTERVAL_MS", str(self.hot_callback_min_interval_ms)))
+        self.critical_loop_sleep_ms = float(os.getenv("CRITICAL_LOOP_SLEEP_MS", str(self.critical_loop_sleep_ms)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2048,7 +2057,7 @@ class PolyBot:
         self._running = True
         self._log_tick = 0
 
-        # [THROTTLE] Controla frequência máxima do hot callback (50ms)
+        # [THROTTLE] Controla frequência máxima do hot callback (configurável)
         self._last_hot_call: float = 0.0
 
         # [FIX 1] Registrar callback event-driven no WebSocket
@@ -2065,13 +2074,14 @@ class PolyBot:
         Roda apenas na zona de reversão (T-9s a T-2s).
         Detecção em ~1ms — sem esperar o main loop acordar.
 
-        [THROTTLE] 50ms mínimo entre chamadas: evita sobrecarga durante
+        [THROTTLE] Intervalo mínimo configurável entre chamadas para evitar sobrecarga durante
         whale burst (quando o trade rate é mais alto e os cálculos O(n)
         seriam chamados centenas de vezes/segundo, criando gargalo).
         """
-        # [THROTTLE] Ignorar calls em menos de 50ms do anterior
+        # [THROTTLE] Ignorar calls em menos do intervalo configurado
         now = time.time()
-        if now - self._last_hot_call < 0.050:
+        hot_interval_s = max(self.cfg.hot_callback_min_interval_ms, 5.0) / 1000.0
+        if now - self._last_hot_call < hot_interval_s:
             return
         self._last_hot_call = now
 
@@ -2364,8 +2374,8 @@ class PolyBot:
 
                 if tr <= self.cfg.reversal_start:
                     # Zona crítica: main loop como backup do event-driven
-                    # 20ms = taxa máxima sem travar a CPU
-                    time.sleep(0.020)
+                    # sleep mínimo configurável para backup de latência
+                    time.sleep(max(self.cfg.critical_loop_sleep_ms, 5.0) / 1000.0)
                 elif tr <= 30:
                     time.sleep(0.30)   # 300ms perto da zona
                 elif tr <= 90:
