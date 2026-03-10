@@ -16,6 +16,7 @@ IMPORTANTE:
 import os
 import json
 import time
+import math
 import threading
 import logging
 from dataclasses import dataclass
@@ -257,6 +258,12 @@ class PolymarketMMClient:
         except Exception as e:
             self.last_error = str(e)
             return ""
+        side_const = BUY if side.upper() == "BUY" else SELL
+        order = self.client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=side_const))
+        resp = self.client.post_order(order, OrderType.GTC)
+        if isinstance(resp, dict):
+            return resp.get("orderID") or resp.get("order_id") or resp.get("id") or ""
+        return ""
 
     def cancel(self, order_id: str):
         if self.cfg.dry_run or not self.client or not order_id:
@@ -392,6 +399,7 @@ class Strategy1MarketMaker:
         if not soid and "not enough balance / allowance" in self.clob.last_error.lower():
             self._on_funds_error(self.clob.last_error)
 
+        soid = self.clob.place_limit(token, "SELL", sell_px, size)
         ts = time.time()
         if boid:
             self.open_orders[boid] = {"ts": ts, "token": token, "side": side_key, "dir": "BUY", "px": buy_px, "size": size}
@@ -451,6 +459,7 @@ class Strategy1MarketMaker:
             if filled:
                 self._simulate_fill(side_key, od["dir"], od["px"], od["size"])
                 self.open_orders.pop(oid, None)
+        log.info(f"🧩 {side_key} quote | buy={buy_px:.2f} sell={sell_px:.2f} size={size:.2f}")
 
     def _cancel_stale(self):
         now = time.time()
