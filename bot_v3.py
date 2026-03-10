@@ -78,12 +78,12 @@ log = logging.getLogger("polybot")
 @dataclass
 class Config:
     # ── Reversal (estratégia principal) ──
-    reversal_start: int = 7            # Começa scanning a T-7s (menos exposição cedo)
+    reversal_start: int = 3            # Opera SOMENTE nos últimos 3 segundos
     reversal_end: int = 1              # Para a T-2s
-    buy_pressure_thresh: float = 0.70  # 70% taker buys = bullish
-    min_vol_surge: float = 1.8         # Surge mínimo: 1.8x a média de 20s
-    min_price_vel: float = 0.0015      # Mínimo 0.0015%/s
-    max_reversal_delta: float = 0.20   # BTC dentro de ±0.20% do target
+    buy_pressure_thresh: float = 0.56  # Mais flexível: aceita mais tipos de entrada
+    min_vol_surge: float = 1.15        # Surge mínimo mais permissivo
+    min_price_vel: float = 0.0004      # Velocidade mínima mais baixa
+    max_reversal_delta: float = 0.45   # Aceita distância maior do target
 
     # ── Priorização dos segundos finais (insight prático) ───────────────────
     final_seconds_start: int = 3       # Região preferida: T-3s até T-1s
@@ -93,23 +93,26 @@ class Config:
     min_cross_factor: float = 1.15     # Força projetada deve cobrir 115% da distância
 
     # ── Robustez de execução e confirmação micro (1s) ────────────────────────
-    min_micro_confirm_buy: float = 0.66   # direção precisa aparecer também na micro-janela
-    min_micro_confirm_vel: float = 0.0010 # velocidade mínima na micro-janela
-    min_micro_confirm_rate: float = 2.0   # trades/s mínimos na micro-janela
-    last_second_max_delta: float = 0.07   # T<=2s: se longe disso, só entra com volume extremo
-    last_second_min_surge: float = 3.2    # T<=2s: exceção para delta mais longo
-    max_odds_age_ms: float = 1200.0       # evita executar com snapshot de odds velho
+    min_micro_confirm_buy: float = 0.53   # confirmação micro menos rígida
+    min_micro_confirm_vel: float = 0.0002 # velocidade mínima mais permissiva
+    min_micro_confirm_rate: float = 0.5   # menor exigência de trades/s
+    last_second_max_delta: float = 0.18   # tolera delta maior no T<=2s
+    last_second_min_surge: float = 1.6    # reduz exigência de volume extremo
+    max_odds_age_ms: float = 700.0        # evita executar com odds stale na zona crítica
 
     # ── Filtro combo δ × volume ──────────────────────────────────────────────
-    weak_combo_delta: float = 0.08    # Se abs_delta ≥ este valor (0.08%)...
-    weak_combo_surge: float = 2.5     # ...exige no mínimo este vol_surge (2.5x)
+    weak_combo_delta: float = 0.16    # Distância maior antes de endurecer o filtro
+    weak_combo_surge: float = 1.3     # Exigência de volume menor
     #   Lógica: distância grande do target SÓ é apostável se o volume confirmar.
     #   Exemplo: δ=0.12%, surge=1.9x → skip ❌  (precisa mover muito com volume fraco)
     #            δ=0.12%, surge=3.1x → ok  ✅  (volume forte confirma o movimento)
     #            δ=0.03%, surge=1.9x → ok  ✅  (distância pequena, qualquer volume serve)
 
     # ── Momentum (fallback) ──
-    momentum_start: int = 10           # era 15 — janela reduzida (menos tempo para reverter)
+    enable_momentum: bool = False      # Desativado: operação exclusiva em REVERSAL
+    hot_callback_min_interval_ms: float = 20.0  # throttle do callback hot (menor = mais reativo)
+    critical_loop_sleep_ms: float = 10.0        # sleep mínimo do loop backup na zona crítica
+    momentum_start: int = 10           # fallback opcional
     momentum_end: int = 5
     min_momentum_delta: float = 0.015
     momentum_buy_thresh: float = 0.62  # era 0.52 — exige convicção real de compra/venda
@@ -123,16 +126,16 @@ class Config:
     max_late_odd: float = 0.87  # odds máximas antes de considerar "já precificado" pelo mercado
 
     # ── Book Imbalance (CLOB) ──────────────────────────────────────────────
-    use_book_imbalance: bool = True
+    use_book_imbalance: bool = False
     max_book_imbalance_against: float = 0.30  # skip se imbalance > 0.30 CONTRA a direção do sinal
     # Exemplo: apostando UP, mas book_imbalance = -0.40 (40% mais liquidez DOWN) → skip
 
     # ── Trade Rate (confirmação de whale real) ────────────────────────────
-    min_trade_rate: float = 3.0  # mínimo de trades/s durante o surge para confirmar atividade real
+    min_trade_rate: float = 0.6  # mínimo de trades/s ainda mais permissivo
 
     # ── Janela de Confirmação do Sinal ────────────────────────────────────
-    signal_confirm_ms: float = 120.0       # T >= 4s: confirmação normal
-    signal_confirm_ms_urgent: float = 60.0  # T <= 3s: confirmação reduzida (tempo escasso)
+    signal_confirm_ms: float = 80.0        # confirmação mais rápida sem perder robustez
+    signal_confirm_ms_urgent: float = 12.0  # últimos 3s: reação ultra-rápida
 
     # ── Scalp (saída antecipada para garantir lucro) ─────────────────────
     enable_scalp: bool = True
@@ -177,6 +180,13 @@ class Config:
         self.max_daily_loss   = float(os.getenv("MAX_DAILY_LOSS",     str(self.max_daily_loss)))
         self.buy_pressure_thresh = float(os.getenv("BUY_PRESSURE_THRESH", str(self.buy_pressure_thresh)))
         self.min_vol_surge    = float(os.getenv("MIN_VOL_SURGE",      str(self.min_vol_surge)))
+        self.min_price_vel     = float(os.getenv("MIN_PRICE_VEL",      str(self.min_price_vel)))
+        self.max_reversal_delta = float(os.getenv("MAX_REVERSAL_DELTA", str(self.max_reversal_delta)))
+        self.min_trade_rate    = float(os.getenv("MIN_TRADE_RATE",     str(self.min_trade_rate)))
+        self.signal_confirm_ms = float(os.getenv("SIGNAL_CONFIRM_MS",  str(self.signal_confirm_ms)))
+        self.signal_confirm_ms_urgent = float(os.getenv("SIGNAL_CONFIRM_MS_URGENT", str(self.signal_confirm_ms_urgent)))
+        self.hot_callback_min_interval_ms = float(os.getenv("HOT_CALLBACK_MIN_INTERVAL_MS", str(self.hot_callback_min_interval_ms)))
+        self.critical_loop_sleep_ms = float(os.getenv("CRITICAL_LOOP_SLEEP_MS", str(self.critical_loop_sleep_ms)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2047,7 +2057,7 @@ class PolyBot:
         self._running = True
         self._log_tick = 0
 
-        # [THROTTLE] Controla frequência máxima do hot callback (50ms)
+        # [THROTTLE] Controla frequência máxima do hot callback (configurável)
         self._last_hot_call: float = 0.0
 
         # [FIX 1] Registrar callback event-driven no WebSocket
@@ -2064,13 +2074,14 @@ class PolyBot:
         Roda apenas na zona de reversão (T-9s a T-2s).
         Detecção em ~1ms — sem esperar o main loop acordar.
 
-        [THROTTLE] 50ms mínimo entre chamadas: evita sobrecarga durante
+        [THROTTLE] Intervalo mínimo configurável entre chamadas para evitar sobrecarga durante
         whale burst (quando o trade rate é mais alto e os cálculos O(n)
         seriam chamados centenas de vezes/segundo, criando gargalo).
         """
-        # [THROTTLE] Ignorar calls em menos de 50ms do anterior
+        # [THROTTLE] Ignorar calls em menos do intervalo configurado
         now = time.time()
-        if now - self._last_hot_call < 0.050:
+        hot_interval_s = max(self.cfg.hot_callback_min_interval_ms, 5.0) / 1000.0
+        if now - self._last_hot_call < hot_interval_s:
             return
         self._last_hot_call = now
 
@@ -2142,7 +2153,7 @@ class PolyBot:
         tr = self._time_remaining(market)
 
         # ── 2. Ativar odds rápidas perto da zona ──
-        self.odds_cache.set_fast(tr <= 35)
+        self.odds_cache.set_fast(tr <= 20)
 
         # ── 3. Log de status ──
         self._log_status(market, tr)
@@ -2170,8 +2181,8 @@ class PolyBot:
                 self._place_bet(market, signal, tr, cached_ask=cached_ask)
                 return
 
-        # ── 7. Fallback momentum (T-10s a T-5s) — só se MOMENTUM não está em cooldown ──
-        if self.cfg.momentum_end <= tr <= self.cfg.momentum_start:
+        # ── 7. Momentum opcional (desativado por padrão) ──
+        if self.cfg.enable_momentum and self.cfg.momentum_end <= tr <= self.cfg.momentum_start:
             ok_mom, _ = self.risk.can_bet(source="MOMENTUM")
             if ok_mom:
                 signal = self.momentum.detect(market.price_to_beat, tr)
@@ -2300,7 +2311,7 @@ class PolyBot:
         zone = ""
         if tr <= self.cfg.reversal_start:
             zone = " ⚡ REVERSAL ZONE!"
-        elif tr <= self.cfg.momentum_start:
+        elif self.cfg.enable_momentum and tr <= self.cfg.momentum_start:
             zone = " 📈 scanning..."
 
         log.info(
@@ -2363,8 +2374,8 @@ class PolyBot:
 
                 if tr <= self.cfg.reversal_start:
                     # Zona crítica: main loop como backup do event-driven
-                    # 20ms = taxa máxima sem travar a CPU
-                    time.sleep(0.020)
+                    # sleep mínimo configurável para backup de latência
+                    time.sleep(max(self.cfg.critical_loop_sleep_ms, 5.0) / 1000.0)
                 elif tr <= 30:
                     time.sleep(0.30)   # 300ms perto da zona
                 elif tr <= 90:
