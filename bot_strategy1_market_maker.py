@@ -210,6 +210,7 @@ class PolymarketMMClient:
     def __init__(self, cfg: MMConfig):
         self.cfg = cfg
         self.client = None
+        self.last_error: str = ""
         if not cfg.dry_run:
             self._init_client()
 
@@ -239,6 +240,7 @@ class PolymarketMMClient:
             return {}
 
     def place_limit(self, token_id: str, side: str, price: float, size: float) -> str:
+        self.last_error = ""
         if self.cfg.dry_run:
             oid = f"DRY_{int(time.time()*1000)}"
             log.info(f"🏃 DRY {side} {size:.2f}@{price:.2f} {token_id[:8]}..")
@@ -246,6 +248,16 @@ class PolymarketMMClient:
         from py_clob_client.clob_types import OrderArgs, OrderType
         from py_clob_client.order_builder.constants import BUY, SELL
 
+        try:
+            side_const = BUY if side.upper() == "BUY" else SELL
+            order = self.client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=side_const))
+            resp = self.client.post_order(order, OrderType.GTC)
+            if isinstance(resp, dict):
+                return resp.get("orderID") or resp.get("order_id") or resp.get("id") or ""
+            return ""
+        except Exception as e:
+            self.last_error = str(e)
+            return ""
         side_const = BUY if side.upper() == "BUY" else SELL
         order = self.client.create_order(OrderArgs(token_id=token_id, price=price, size=size, side=side_const))
         resp = self.client.post_order(order, OrderType.GTC)
@@ -309,10 +321,17 @@ class Strategy1MarketMaker:
         self.market: Optional[MarketRef] = None
         self.open_orders: Dict[str, dict] = {}
         self.inventory = {"UP": 0.0, "DOWN": 0.0}
+        self.positions = {
+            "UP": {"qty": 0.0, "avg": 0.0},
+            "DOWN": {"qty": 0.0, "avg": 0.0},
+        }
         self.realized_pnl = 0.0
 
         self._running = True
         self._last_quote_ts = 0.0
+        self._funds_block_until = 0.0
+        self._last_funds_warn = 0.0
+        self._last_pnl_log = 0.0
 
     def _book_stats(self, token_id: str) -> Tuple[float, float, float, float]:
         b = self.clob.get_book(token_id)
@@ -372,6 +391,14 @@ class Strategy1MarketMaker:
             return
 
         boid = self.clob.place_limit(token, "BUY", buy_px, size)
+        if not boid and "not enough balance / allowance" in self.clob.last_error.lower():
+            self._on_funds_error(self.clob.last_error)
+            return
+
+        soid = self.clob.place_limit(token, "SELL", sell_px, size)
+        if not soid and "not enough balance / allowance" in self.clob.last_error.lower():
+            self._on_funds_error(self.clob.last_error)
+
         soid = self.clob.place_limit(token, "SELL", sell_px, size)
         ts = time.time()
         if boid:
@@ -379,6 +406,59 @@ class Strategy1MarketMaker:
         if soid:
             self.open_orders[soid] = {"ts": ts, "token": token, "side": side_key, "dir": "SELL", "px": sell_px, "size": size}
 
+        if boid or soid:
+            log.info(f"🧩 {side_key} quote | buy={buy_px:.2f} sell={sell_px:.2f} size={size:.2f}")
+
+    def _on_funds_error(self, msg: str):
+        self._funds_block_until = time.time() + 120.0
+        now = time.time()
+        if now - self._last_funds_warn > 10:
+            self._last_funds_warn = now
+            log.error("❌ Saldo/allowance insuficiente. Pausando 120s para evitar spam de ordens.")
+            log.error("   Corrija: saldo USDC + allowance na Polymarket/CLOB wallet.")
+            log.debug(f"   detalhe: {msg}")
+
+    def _simulate_fill(self, side_key: str, direction: str, price: float, size: float):
+        pos = self.positions[side_key]
+        if direction == "BUY":
+            total_cost = pos["avg"] * pos["qty"] + price * size
+            pos["qty"] += size
+            pos["avg"] = total_cost / pos["qty"] if pos["qty"] > 0 else 0.0
+            self.inventory[side_key] += size
+            return
+
+        # SELL: realiza PnL contra posição comprada existente
+        close_qty = min(size, pos["qty"])
+        pnl = 0.0
+        if close_qty > 0:
+            pnl = (price - pos["avg"]) * close_qty
+            pos["qty"] -= close_qty
+            if pos["qty"] <= 1e-9:
+                pos["qty"] = 0.0
+                pos["avg"] = 0.0
+            self.inventory[side_key] -= close_qty
+            self.realized_pnl += pnl
+            tag = "💰 TAKE PROFIT" if pnl > 0 else "🔻 Realized"
+            log.info(f"{tag} {side_key} | qty={close_qty:.2f} exit={price:.2f} pnl={pnl:+.4f} | pnl_total={self.realized_pnl:+.4f}")
+
+    def _simulate_dry_fills(self, best: Dict[str, Tuple[float, float]]):
+        if not self.cfg.dry_run:
+            return
+        for oid, od in list(self.open_orders.items()):
+            if not oid.startswith("DRY_"):
+                continue
+            side_key = od["side"]
+            if side_key not in best:
+                continue
+            best_bid, best_ask = best[side_key]
+            filled = False
+            if od["dir"] == "BUY" and od["px"] >= best_ask and best_ask > 0:
+                filled = True
+            if od["dir"] == "SELL" and od["px"] <= best_bid and best_bid > 0:
+                filled = True
+            if filled:
+                self._simulate_fill(side_key, od["dir"], od["px"], od["size"])
+                self.open_orders.pop(oid, None)
         log.info(f"🧩 {side_key} quote | buy={buy_px:.2f} sell={sell_px:.2f} size={size:.2f}")
 
     def _cancel_stale(self):
@@ -416,6 +496,7 @@ class Strategy1MarketMaker:
             self.market = m
             self.open_orders.clear()
             self.inventory = {"UP": 0.0, "DOWN": 0.0}
+            self.positions = {"UP": {"qty": 0.0, "avg": 0.0}, "DOWN": {"qty": 0.0, "avg": 0.0}}
             log.info(f"🆕 Market: {m.slug}")
 
     def run(self):
@@ -437,9 +518,15 @@ class Strategy1MarketMaker:
                     time.sleep(self.cfg.loop_ms / 1000.0)
                     continue
 
+                if time.time() < self._funds_block_until:
+                    time.sleep(self.cfg.loop_ms / 1000.0)
+                    continue
+
                 if (time.time() - self._last_quote_ts) * 1000.0 >= self.cfg.quote_refresh_ms:
                     up_bid, up_ask, up_spread, up_imb = self._book_stats(self.market.up_token)
                     dn_bid, dn_ask, dn_spread, dn_imb = self._book_stats(self.market.down_token)
+
+                    self._simulate_dry_fills({"UP": (up_bid, up_ask), "DOWN": (dn_bid, dn_ask)})
 
                     # Quote UP token
                     up_buy, up_sell, up_edge = self._compute_quote("UP", up_bid, up_ask, up_spread, up_imb, tr_s)
@@ -458,6 +545,14 @@ class Strategy1MarketMaker:
                 self._cancel_stale()
                 self._mark_to_model_reward()
                 self.tape.decay()
+
+                if time.time() - self._last_pnl_log > 30:
+                    self._last_pnl_log = time.time()
+                    log.info(
+                        f"📈 PnL={self.realized_pnl:+.4f} | pos_UP={self.positions['UP']['qty']:.2f}@{self.positions['UP']['avg']:.3f} "
+                        f"| pos_DN={self.positions['DOWN']['qty']:.2f}@{self.positions['DOWN']['avg']:.3f} | ordens={len(self.open_orders)}"
+                    )
+
                 time.sleep(self.cfg.loop_ms / 1000.0)
             except KeyboardInterrupt:
                 break
