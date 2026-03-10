@@ -78,12 +78,27 @@ log = logging.getLogger("polybot")
 @dataclass
 class Config:
     # ── Reversal (estratégia principal) ──
-    reversal_start: int = 9            # Começa scanning a T-9s
+    reversal_start: int = 7            # Começa scanning a T-7s (menos exposição cedo)
     reversal_end: int = 1              # Para a T-2s
     buy_pressure_thresh: float = 0.70  # 70% taker buys = bullish
     min_vol_surge: float = 1.8         # Surge mínimo: 1.8x a média de 20s
     min_price_vel: float = 0.0015      # Mínimo 0.0015%/s
     max_reversal_delta: float = 0.20   # BTC dentro de ±0.20% do target
+
+    # ── Priorização dos segundos finais (insight prático) ───────────────────
+    final_seconds_start: int = 3       # Região preferida: T-3s até T-1s
+    early_reversal_max_delta: float = 0.10  # Antes de T-3, aceita só distância menor
+    early_min_vol_surge: float = 2.4   # Antes de T-3, exige surge mais forte
+    early_min_confidence: float = 0.45 # Antes de T-3, exige confiança maior
+    min_cross_factor: float = 1.15     # Força projetada deve cobrir 115% da distância
+
+    # ── Robustez de execução e confirmação micro (1s) ────────────────────────
+    min_micro_confirm_buy: float = 0.66   # direção precisa aparecer também na micro-janela
+    min_micro_confirm_vel: float = 0.0010 # velocidade mínima na micro-janela
+    min_micro_confirm_rate: float = 2.0   # trades/s mínimos na micro-janela
+    last_second_max_delta: float = 0.07   # T<=2s: se longe disso, só entra com volume extremo
+    last_second_min_surge: float = 3.2    # T<=2s: exceção para delta mais longo
+    max_odds_age_ms: float = 1200.0       # evita executar com snapshot de odds velho
 
     # ── Filtro combo δ × volume ──────────────────────────────────────────────
     weak_combo_delta: float = 0.08    # Se abs_delta ≥ este valor (0.08%)...
@@ -775,6 +790,12 @@ class ReversalDetector:
         vol_surge = self.buf.vol_surge_ratio(short_s=3.0, baseline_s=20.0)
         price_vel = self.buf.price_velocity(3.0)
         accel = self.buf.price_acceleration()
+        in_final_window = tr <= cfg.final_seconds_start
+
+        # Micro-confirmação (1s): evita entrar em spike único sem continuidade.
+        buy_ratio_1s, _ = self.buf.buy_pressure(1.0)
+        price_vel_1s = self.buf.price_velocity(1.0)
+        trade_rate_1s = self.buf.trade_rate(1.0)
 
         # Volume mínimo para sinal válido (~0.02 BTC em 3s)
         if total_vol_3s < 0.02:
@@ -795,12 +816,62 @@ class ReversalDetector:
             )
             return None
 
+        # ── Filtro temporal: fora dos segundos finais, só entra com setup mais "limpo" ──
+        if not in_final_window:
+            if abs_delta > cfg.early_reversal_max_delta:
+                log.debug(
+                    f"  REVERSAL skip: cedo e longe do target "
+                    f"δ={abs_delta:.3f}% > {cfg.early_reversal_max_delta:.3f}%"
+                )
+                return None
+            if vol_surge < max(cfg.min_vol_surge, cfg.early_min_vol_surge):
+                log.debug(
+                    f"  REVERSAL skip: cedo com surge fraco "
+                    f"{vol_surge:.2f}x < {max(cfg.min_vol_surge, cfg.early_min_vol_surge):.2f}x"
+                )
+                return None
+
         direction = self._direction(delta_pct, buy_ratio, vol_surge, price_vel, abs_delta)
         if direction is None:
             return None
 
+        # ── Micro-confirmação direcional (1s) ────────────────────────────────
+        if trade_rate_1s < cfg.min_micro_confirm_rate:
+            return None
+        if direction == "UP":
+            if buy_ratio_1s < cfg.min_micro_confirm_buy or price_vel_1s < cfg.min_micro_confirm_vel:
+                return None
+        else:
+            if (1.0 - buy_ratio_1s) < cfg.min_micro_confirm_buy or price_vel_1s > -cfg.min_micro_confirm_vel:
+                return None
+
+        # ── Last-second guard: no T<=2s, exige estar perto ou volume extremo ──
+        if tr <= 2 and abs_delta > cfg.last_second_max_delta and vol_surge < cfg.last_second_min_surge:
+            log.debug(
+                f"  REVERSAL skip: T<=2s longe do alvo sem volume extremo "
+                f"δ={abs_delta:.4f}% surge={vol_surge:.2f}x"
+            )
+            return None
+
+        # ── Check de "força de cruzamento": evita entrar quando move forte não basta ──
+        # projected_move estima quanto o preço ainda pode deslocar até o fechamento.
+        directional_pressure = buy_ratio if direction == "UP" else (1.0 - buy_ratio)
+        pressure_bonus = 1.0 + max(0.0, directional_pressure - cfg.buy_pressure_thresh)
+        surge_bonus = 1.0 + max(0.0, vol_surge - 1.0) * 0.20
+        projected_move = abs(price_vel) * max(float(tr), 1.0) * pressure_bonus * surge_bonus
+        cross_factor = cfg.min_cross_factor if not in_final_window else max(1.0, cfg.min_cross_factor - 0.10)
+        required_move = abs_delta * cross_factor
+        if projected_move < required_move:
+            log.debug(
+                f"  REVERSAL skip: sem força para cruzar "
+                f"proj={projected_move:.4f}% < req={required_move:.4f}% "
+                f"(δ={abs_delta:.4f}%, tr={tr}s)"
+            )
+            return None
+
         confidence = self._confidence(buy_ratio, vol_surge, price_vel, abs_delta, accel, direction)
-        if confidence < 0.35:
+        min_conf = 0.35 if in_final_window else cfg.early_min_confidence
+        if confidence < min_conf:
             return None
 
         # ── Odds: já precificadas? (único threshold configurável) ────────────
@@ -2144,6 +2215,12 @@ class PolyBot:
                 f"  📍  δ={signal.delta_pct:+.4f}% │ BTC=${current:,.2f} │ PTB=${market.price_to_beat:,.2f}\n"
                 f"{'─'*60}"
             )
+
+            # Segurança: evita executar com odds snapshot muito antigo.
+            snap_age_ms = (time.time() - self.odds_cache.get().timestamp) * 1000.0
+            if snap_age_ms > self.cfg.max_odds_age_ms:
+                log.warning(f"⚠️  Skip entry: odds stale ({snap_age_ms:.0f}ms > {self.cfg.max_odds_age_ms:.0f}ms)")
+                return
 
             # [FIX 3] Passa cached_ask → executor não faz REST call
             exec_result = self.executor.execute(token_id, bet_amount, signal.direction, cached_price=cached_ask)
